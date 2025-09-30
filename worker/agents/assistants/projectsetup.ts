@@ -100,7 +100,6 @@ export class ProjectSetupAssistant extends Assistant<Env> {
             blueprint,
             templateDetails: template,
             dependencies: template.deps,
-            forCodegen: false
         }))]);
         this.query = query;
         this.logger = createObjectLogger(this, 'ProjectSetupAssistant')
@@ -128,7 +127,7 @@ ${error}`);
                 modelName: error? AIModels.GEMINI_2_5_FLASH : undefined,
             });
             if (!results || typeof results !== 'string') {
-                this.logger.info(`Failed to generate setup commands, results: ${results}`);
+                this.logger.info(`Failed to generate setup commands, results: `, { results });
                 return { commands: [] };
             }
 

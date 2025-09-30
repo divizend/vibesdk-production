@@ -10,8 +10,8 @@ import {
 import { GitHubPushRequest, PreviewType, StaticAnalysisResponse, TemplateDetails } from '../../services/sandbox/sandboxTypes';
 import {  GitHubExportResult } from '../../services/github/types';
 import { CodeGenState, CurrentDevState, MAX_PHASES, FileState } from './state';
-import { AllIssues, AgentSummary, ScreenshotData, AgentInitArgs } from './types';
-import { WebSocketMessageResponses } from '../constants';
+import { AllIssues, AgentSummary, ScreenshotData, AgentInitArgs, PhaseExecutionResult } from './types';
+import { MAX_DEPLOYMENT_RETRIES, PREVIEW_EXPIRED_ERROR, WebSocketMessageResponses } from '../constants';
 import { broadcastToConnections, handleWebSocketClose, handleWebSocketMessage } from './websocket';
 import { createObjectLogger, StructuredLogger } from '../../logger';
 import { ProjectSetupAssistant } from '../assistants/projectsetup';
@@ -483,6 +483,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         }
 
         let staticAnalysisCache: StaticAnalysisResponse | undefined;
+        let userSuggestions: string[] | undefined;
 
         // Store review cycles for later use
         this.setState({
@@ -491,7 +492,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         });
 
         try {
-            let executionResults: {currentDevState: CurrentDevState, staticAnalysis?: StaticAnalysisResponse, result?: PhaseConceptType};
+            let executionResults: PhaseExecutionResult;
             // State machine loop - continues until IDLE state
             while (currentDevState !== CurrentDevState.IDLE) {
                 this.logger().info(`[generateAllFiles] Executing state: ${currentDevState}`);
@@ -501,9 +502,10 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                         currentDevState = executionResults.currentDevState;
                         phaseConcept = executionResults.result;
                         staticAnalysisCache = executionResults.staticAnalysis;
+                        userSuggestions = executionResults.userSuggestions;
                         break;
                     case CurrentDevState.PHASE_IMPLEMENTING:
-                        executionResults = await this.executePhaseImplementation(phaseConcept, staticAnalysisCache);
+                        executionResults = await this.executePhaseImplementation(phaseConcept, staticAnalysisCache, userSuggestions);
                         currentDevState = executionResults.currentDevState;
                         staticAnalysisCache = executionResults.staticAnalysis;
                         break;
@@ -547,7 +549,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     /**
      * Execute phase generation state - generate next phase with user suggestions
      */
-    async executePhaseGeneration(): Promise<{currentDevState: CurrentDevState, result?:  PhaseConceptType, staticAnalysis?: StaticAnalysisResponse}> {
+    async executePhaseGeneration(): Promise<PhaseExecutionResult> {
         this.logger().info("Executing PHASE_GENERATING state");
         try {
             const currentIssues = await this.fetchAllIssues();
@@ -572,7 +574,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             return {
                 currentDevState: CurrentDevState.PHASE_IMPLEMENTING,
                 result: nextPhase,
-                staticAnalysis: currentIssues.staticAnalysis
+                staticAnalysis: currentIssues.staticAnalysis,
+                userSuggestions: userSuggestions
             };
         } catch (error) {
             this.logger().error("Error generating phase", error);
@@ -592,7 +595,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     /**
      * Execute phase implementation state - implement current phase
      */
-    async executePhaseImplementation(phaseConcept?: PhaseConceptType, staticAnalysis?: StaticAnalysisResponse): Promise<{currentDevState: CurrentDevState, staticAnalysis?: StaticAnalysisResponse}> {
+    async executePhaseImplementation(phaseConcept?: PhaseConceptType, staticAnalysis?: StaticAnalysisResponse, userSuggestions?: string[]): Promise<{currentDevState: CurrentDevState, staticAnalysis?: StaticAnalysisResponse}> {
         try {
             this.logger().info("Executing PHASE_IMPLEMENTING state");
     
@@ -623,12 +626,11 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                     clientErrors: this.state.clientReportedErrors
                 };
             } else {
-                currentIssues = await this.fetchAllIssues()
-                this.resetIssues();
+                currentIssues = await this.fetchAllIssues(true)
             }
             
             // Implement the phase
-            await this.implementPhase(phaseConcept, currentIssues);
+            await this.implementPhase(phaseConcept, currentIssues, userSuggestions);
     
             this.logger().info(`Phase ${phaseConcept.name} completed, generating next phase`);
 
@@ -768,8 +770,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             ]
         });
 
-        const currentIssues = await this.fetchAllIssues();
-        this.resetIssues();
+        const currentIssues = await this.fetchAllIssues(true);
         
         // Run final review and cleanup phase
         await this.implementPhase(phaseConcept, currentIssues);
@@ -841,7 +842,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                     completed: false
                 }
             ],
-            pendingUserInputs: []
         });
         // Notify phase generation complete
         this.broadcast(WebSocketMessageResponses.PHASE_GENERATED, {
@@ -856,7 +856,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
      * Implement a single phase of code generation
      * Streams file generation with real-time updates and incorporates technical instructions
      */
-    async implementPhase(phase: PhaseConceptType, currentIssues: AllIssues, streamChunks: boolean = true): Promise<PhaseImplementationSchemaType> {
+    async implementPhase(phase: PhaseConceptType, currentIssues: AllIssues, userSuggestions?: string[], streamChunks: boolean = true): Promise<PhaseImplementationSchemaType> {
         const context = GenerationContext.from(this.state, this.logger());
         const issues = IssueReport.from(currentIssues);
         
@@ -879,6 +879,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                         filePurpose: filePurpose
                     });
                 },
+                userSuggestions,
                 shouldAutoFix: this.state.inferenceContext.enableRealtimeCodeFix,
                 fileChunkGeneratedCallback: streamChunks ? (filePath: string, chunk: string, format: 'full_content' | 'unified_diff') => {
                     this.broadcast(WebSocketMessageResponses.FILE_CHUNK_GENERATED, {
@@ -928,7 +929,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         // Execute commands if provided
         if (result.commands && result.commands.length > 0) {
             this.logger().info("Phase implementation suggested install commands:", result.commands);
-            await this.executeCommands(result.commands);
+            await this.executeCommands(result.commands, false);
         }
     
         // Deploy generated files
@@ -967,7 +968,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         const updatedPhases = previousPhases.map(p => p.name === phase.name ? {...p, completed: true} : p);
         this.setState({
             ...this.state,
-            generatedPhases: updatedPhases
+            generatedPhases: updatedPhases,
+            pendingUserInputs: []   // Reset pending user inputs in phase implementation so we can use it in this operation as well
         });
 
         this.logger().info("Completed phases:", JSON.stringify(updatedPhases, null, 2));
@@ -1047,8 +1049,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
      */
     async reviewCode() {
         const context = GenerationContext.from(this.state, this.logger());
-        const issues = await this.fetchAllIssues();
-        this.resetIssues();
+        const issues = await this.fetchAllIssues(true);
         const issueReport = IssueReport.from(issues);
 
         // Report discovered issues
@@ -1167,8 +1168,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             // Add FileState-specific properties if missing
             migratedFilesMap[key] = {
                 ...migratedFile,
-                last_hash: migratedFile.last_hash || '',
-                last_modified: migratedFile.last_modified || Date.now(),
+                lasthash: migratedFile.lasthash || '',
+                lastmodified: migratedFile.lastmodified || Date.now(),
                 unmerged: migratedFile.unmerged || []
             };
             
@@ -1537,11 +1538,12 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                     const moduleNames = modulesNotFound.flatMap(issue => {
                         const match = issue.reason.match(/External package ["'](.+?)["']/);
                         const name = match?.[1];
-                        return (typeof name === 'string' && name.trim().length > 0) ? [name] : [];
+                        return (typeof name === 'string' && name.trim().length > 0 && !name.startsWith('@shared')) ? [name] : [];
                     });
                     if (moduleNames.length > 0) {
                         const installCommands = moduleNames.map(moduleName => `bun install ${moduleName}`);
-                        await this.executeCommands(installCommands);
+                        await this.executeCommands(installCommands, false);
+
                         this.logger().info(`Deterministic code fixer installed missing modules: ${moduleNames.join(', ')}`);
                     } else {
                         this.logger().info(`Deterministic code fixer detected no external modules to install from unfixable TS2307 issues`);
@@ -1570,9 +1572,9 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         // return undefined;
     }
 
-    async fetchAllIssues(): Promise<AllIssues> {
+    async fetchAllIssues(resetIssues: boolean = false): Promise<AllIssues> {
         const [runtimeErrors, staticAnalysis] = await Promise.all([
-            this.fetchRuntimeErrors(false),
+            this.fetchRuntimeErrors(resetIssues),
             this.runStaticAnalysisCode()
         ]);
         
@@ -1580,15 +1582,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         this.logger().info("Fetched all issues:", JSON.stringify({ runtimeErrors, staticAnalysis, clientErrors }));
         
         return { runtimeErrors, staticAnalysis, clientErrors };
-    }
-
-    async resetIssues() {
-        this.logger().info("Resetting issues");
-        await this.getSandboxServiceClient().clearInstanceErrors(this.state.sandboxInstanceId!);
-        this.setState({
-            ...this.state,
-            clientReportedErrors: []
-        });
     }
 
     async deployToSandbox(files: FileOutputType[] = [], redeploy: boolean = false, commitMessage?: string): Promise<PreviewType | null> {
@@ -1652,7 +1645,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         throw new Error(`Failed to create sandbox instance: ${createResponse?.error || 'Unknown error'}`);
     }
 
-    private async executeDeployment(files: FileOutputType[] = [], redeploy: boolean = false, commitMessage?: string): Promise<PreviewType | null> {
+    private async executeDeployment(files: FileOutputType[] = [], redeploy: boolean = false, commitMessage?: string, retries: number = MAX_DEPLOYMENT_RETRIES): Promise<PreviewType | null> {
         const { templateDetails, generatedFilesMap } = this.state;
         let { sandboxInstanceId } = this.state;
         let previewURL: string | undefined;
@@ -1676,7 +1669,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         // Check if the instance is running
         if (sandboxInstanceId) {
             const status = await this.getSandboxServiceClient().getInstanceStatus(sandboxInstanceId);
-            if (!status || !status.success || !status.isHealthy) {
+            if (!status.success || !status.isHealthy) {
                 this.logger().error(`DEPLOYMENT CHECK FAILED: Failed to get status for instance ${sandboxInstanceId}, redeploying...`);
                 sandboxInstanceId = undefined;
             } else {
@@ -1704,8 +1697,21 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                     sandboxInstanceId,
                 });
 
-                // Run all commands in background
-                this.executeCommands(this.state.commandsHistory || [], 20);
+                if (this.state.commandsHistory && this.state.commandsHistory.length > 0) {
+                    // Run all commands in background
+                    let cmds = this.state.commandsHistory;
+                    if (cmds.length > 10) {
+                        cmds =  Array.from(new Set(this.state.commandsHistory));
+                        // I am aware this will messup the ordering of commands and may cause issues but those would be in very rare cases
+                        // because usually LLMs will only generate install commands or rm commands. 
+                        // This is to handle the bug still present in a lot of apps because of an exponential growth of commands
+                    }
+                    this.getSandboxServiceClient().executeCommands(sandboxInstanceId, cmds);
+                    this.broadcast(WebSocketMessageResponses.COMMAND_EXECUTING, {
+                        message: "Executing setup commands",
+                        commands: cmds,
+                    });
+                }
 
                 // Launch a set interval to check the health of the deployment. If it fails, redeploy
                 const checkHealthInterval = setInterval(async () => {
@@ -1755,7 +1761,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         } catch (error) {
             this.logger().error("Error deploying to sandbox service:", error);
             const errorMsg = error instanceof Error ? error.message : String(error);
-            if (errorMsg.includes('Network connection lost')) {
+            if (errorMsg.includes('Network connection lost') || errorMsg.includes('Container service disconnected')) {
                 // For this particular error, reset the sandbox sessionId
                 this.resetSessionId();
             }
@@ -1764,10 +1770,18 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                 ...this.state,
                 sandboxInstanceId: undefined,
             });
+            if (retries > 0) {
+                this.broadcast(WebSocketMessageResponses.DEPLOYMENT_FAILED, {
+                    error: `Error deploying to sandbox service: ${errorMsg}, Will retry...`,
+                });
+                // Wait for exponential backoff
+                await new Promise(resolve => setTimeout(resolve, Math.pow(2, MAX_DEPLOYMENT_RETRIES - retries) * 1000));
+                return this.executeDeployment(files, redeploy, commitMessage, retries - 1);
+            }
             this.broadcast(WebSocketMessageResponses.DEPLOYMENT_FAILED, {
-                error: `Error deploying to sandbox service: ${errorMsg}`,
+                error: `Error deploying to sandbox service: ${errorMsg}. Please report an issue if this persists`,
             });
-            return this.deployToSandbox();
+            return null;
         }
     }
 
@@ -1815,24 +1829,25 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
 
             const deploymentResult = await this.getSandboxServiceClient().deployToCloudflareWorkers(this.state.sandboxInstanceId);
             this.logger().info('[DeployToCloudflare] Deployment result:', deploymentResult);
-            if (!deploymentResult) {
-                this.logger().error('[DeployToCloudflare] Deployment API call failed');
-                this.broadcast(WebSocketMessageResponses.CLOUDFLARE_DEPLOYMENT_ERROR, {
-                    message: 'Deployment failed: API call returned null',
-                    error: 'Deployment service unavailable'
-                });
-                return null;
-            }
-
             if (!deploymentResult.success) {
                 this.logger().error('Deployment failed', {
                     message: deploymentResult.message,
                     error: deploymentResult.error
                 });
-                this.broadcast(WebSocketMessageResponses.CLOUDFLARE_DEPLOYMENT_ERROR, {
-                    message: `Deployment failed: ${deploymentResult.message}`,
-                    error: deploymentResult.error || 'Unknown deployment error'
-                });
+                if (deploymentResult.error?.includes('Failed to read instance metadata') || deploymentResult.error?.includes(`/bin/sh: 1: cd: can't cd to i-`)) {
+                    this.logger().error('Deployment sandbox died');
+                    // Re-deploy
+                    this.deployToSandbox();
+                    this.broadcast(WebSocketMessageResponses.CLOUDFLARE_DEPLOYMENT_ERROR, {
+                        message: PREVIEW_EXPIRED_ERROR,
+                        error: PREVIEW_EXPIRED_ERROR
+                    });
+                } else {
+                    this.broadcast(WebSocketMessageResponses.CLOUDFLARE_DEPLOYMENT_ERROR, {
+                        message: `Deployment failed: ${deploymentResult.message}`,
+                        error: deploymentResult.error || 'Unknown deployment error'
+                    });
+                }
                 return null;
             }
 
@@ -1877,28 +1892,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         }
     }
 
-    // async analyzeScreenshot(): Promise<ScreenshotAnalysisType | null> {
-    //     const screenshotData = this.state.latestScreenshot;
-    //     if (!screenshotData) {
-    //         this.logger().warn('No screenshot available for analysis');
-    //         return null;
-    //     }
-
-    //     const context = GenerationContext.from(this.state, this.logger());    
-    //     const result = await this.operations.analyzeScreenshot.execute(
-    //         {screenshotData},
-    //         {
-    //             env: this.env,
-    //             agentId: this.getAgentId(),
-    //             context,
-    //             logger: this.logger(),
-    //             inferenceContext: this.state.inferenceContext,
-    //         }
-    //     );
-
-    //     return result || null;
-    // }
-
     async waitForGeneration(): Promise<void> {
         if (this.state.generationPromise) {
             try {
@@ -1931,14 +1924,14 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         typeOrMsg: WebSocketMessageType | string | ArrayBuffer | ArrayBufferView<ArrayBufferLike>, 
         dataOrWithout?: WebSocketMessageData<WebSocketMessageType> | unknown
     ): void {
-        // Send the event to the conversational assistant if its a relevant event
-        if (this.operations.processUserMessage.isProjectUpdateType(typeOrMsg)) {
-            const messages = this.operations.processUserMessage.processProjectUpdates(typeOrMsg, dataOrWithout as WebSocketMessageData<WebSocketMessageType>, this.logger());
-            this.setState({
-                ...this.state,
-                conversationMessages: [...this.state.conversationMessages, ...messages]
-            });
-        }
+        // // Send the event to the conversational assistant if its a relevant event
+        // if (this.operations.processUserMessage.isProjectUpdateType(typeOrMsg)) {
+        //     const messages = this.operations.processUserMessage.processProjectUpdates(typeOrMsg, dataOrWithout as WebSocketMessageData<WebSocketMessageType>, this.logger());
+        //     this.setState({
+        //         ...this.state,
+        //         conversationMessages: [...this.state.conversationMessages, ...messages]
+        //     });
+        // }
         broadcastToConnections(this, typeOrMsg as WebSocketMessageType, dataOrWithout as WebSocketMessageData<WebSocketMessageType>);
     }
 
@@ -2066,7 +2059,7 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
      * Execute commands with retry logic
      * Chunks commands and retries failed ones with AI assistance
      */
-    private async executeCommands(commands: string[], chunkSize: number = 5): Promise<void> {
+    private async executeCommands(commands: string[], shouldRetry: boolean = true, chunkSize: number = 5): Promise<void> {
         const state = this.state;
         if (!state.sandboxInstanceId) {
             this.logger().warn('No sandbox instance available for executing commands');
@@ -2083,7 +2076,10 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         commands = commands.map(cmd => cmd.trim().replace(/^\s*-\s*/, '').replace(/^npm/, 'bun'));
         this.logger().info(`AI suggested ${commands.length} commands to run: ${commands.join(", ")}`);
 
-        // Execute in chunks of 5 for better reliability
+        // Remove duplicate commands
+        commands = Array.from(new Set(commands));
+
+        // Execute in chunks
         const commandChunks = [];
         for (let i = 0; i < commands.length; i += chunkSize) {
             commandChunks.push(commands.slice(i, i + chunkSize));
@@ -2094,61 +2090,89 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
         for (const chunk of commandChunks) {
             // Retry failed commands up to 3 times
             let currentChunk = chunk;
-            for (let i = 0; i < 3 && currentChunk.length > 0; i++) {
+            let retryCount = 0;
+            const maxRetries = shouldRetry ? 3 : 1;
+            
+            while (currentChunk.length > 0 && retryCount < maxRetries) {
                 try {
                     this.broadcast(WebSocketMessageResponses.COMMAND_EXECUTING, {
-                        message: "Executing commands",
+                        message: retryCount > 0 ? `Retrying commands (attempt ${retryCount + 1}/${maxRetries})` : "Executing commands",
                         commands: currentChunk
                     });
+                    
                     const resp = await this.getSandboxServiceClient().executeCommands(
                         state.sandboxInstanceId,
                         currentChunk
                     );
-                    if (!resp || !resp.results) {
-                        this.logger().error('Failed to execute commands');
-                        return;
-                    }
-
-                    // Filter out successful commands
-                    const successful = resp.results.filter(r => r.success);
-                    const failures = resp.results.filter(r => !r.success);
-
-                    if (successful.length > 0) {
-                        this.logger().info(`Commands executed successfully: ${currentChunk.join(", ")}`);
-                        successfulCommands.push(...successful.map(r => r.command));
-
-                        if (successful.length === currentChunk.length) {
-                            this.logger().info(`All commands executed successfully in this chunk: ${currentChunk.join(", ")}`);
-                            break;
+                    if (!resp.results || !resp.success) {
+                        this.logger().error('Failed to execute commands', { response: resp });
+                        // Check if instance is still running
+                        const status = await this.getSandboxServiceClient().getInstanceStatus(state.sandboxInstanceId);
+                        if (!status.success || !status.isHealthy) {
+                            this.logger().error(`Instance ${state.sandboxInstanceId} is no longer running`);
+                            return;
                         }
-                    }
-                    
-                    if (failures.length > 0) {
-                        this.logger().warn(`Some commands failed to execute: ${failures.map(r => r.command).join(", ")}, will retry`);
-                    } else {
-                        this.logger().error(`This should never happen, while executing commands ${currentChunk.join(", ")}, response: ${JSON.stringify(resp)}`);
-                    }
-                    // Use AI to regenerate failed commands
-                    const newCommands = await this.getProjectSetupAssistant().generateSetupCommands(
-                        `The following failures were reported: ${failures.length > 0 ? JSON.stringify(failures, null, 2) :  currentChunk.join(", ")}. The following commands were successful: ${successful.map(r => r.command).join(", ")}`
-                    );
-                    if (newCommands?.commands) {
-                        this.logger().info(`Generated new commands: ${newCommands.commands.join(", ")}`);
-                        this.broadcast(WebSocketMessageResponses.COMMAND_EXECUTING, {
-                            message: "Executing regenerated commands",
-                            commands: newCommands.commands
-                        });
-                        currentChunk = newCommands.commands.filter(looksLikeCommand);
-                    } else {
                         break;
                     }
 
-                    this.broadcast(WebSocketMessageResponses.ERROR, {
-                        error: `Failed to execute commands: ${failures.map(r => r.command).join(", ")}`,
-                        failures
-                    });
+                    // Process results
+                    const successful = resp.results.filter(r => r.success);
+                    const failures = resp.results.filter(r => !r.success);
+
+                    // Track successful commands
+                    if (successful.length > 0) {
+                        const successfulCmds = successful.map(r => r.command);
+                        this.logger().info(`Successfully executed ${successful.length} commands: ${successfulCmds.join(", ")}`);
+                        successfulCommands.push(...successfulCmds);
+                    }
+
+                    // If all succeeded, move to next chunk
+                    if (failures.length === 0) {
+                        this.logger().info(`All commands in chunk executed successfully`);
+                        break;
+                    }
+                    
+                    // Handle failures
+                    const failedCommands = failures.map(r => r.command);
+                    this.logger().warn(`${failures.length} commands failed: ${failedCommands.join(", ")}`);
+                    
+                    // Only retry if shouldRetry is true
+                    if (!shouldRetry) {
+                        break;
+                    }
+                    
+                    retryCount++;
+                    
+                    // For install commands, try AI regeneration
+                    const failedInstallCommands = failedCommands.filter(cmd => 
+                        cmd.startsWith("bun") || cmd.startsWith("npm") || cmd.includes("install")
+                    );
+                    
+                    if (failedInstallCommands.length > 0 && retryCount < maxRetries) {
+                        // Use AI to suggest alternative commands
+                        const newCommands = await this.getProjectSetupAssistant().generateSetupCommands(
+                            `The following install commands failed: ${JSON.stringify(failures, null, 2)}. Please suggest alternative commands.`
+                        );
+                        
+                        if (newCommands?.commands && newCommands.commands.length > 0) {
+                            this.logger().info(`AI suggested ${newCommands.commands.length} alternative commands`);
+                            this.broadcast(WebSocketMessageResponses.COMMAND_EXECUTING, {
+                                message: "Executing regenerated commands",
+                                commands: newCommands.commands
+                            });
+                            currentChunk = newCommands.commands.filter(looksLikeCommand);
+                        } else {
+                            this.logger().warn('AI could not generate alternative commands');
+                            currentChunk = [];
+                        }
+                    } else {
+                        // No retry needed for non-install commands
+                        currentChunk = [];
+                    }
                 } catch (error) {
                     this.logger().error('Error executing commands:', error);
+                    // Stop retrying on error
+                    break;
                 }
             }
         }
@@ -2170,10 +2194,6 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             ...this.state,
             commandsHistory: [
                 ...(this.state.commandsHistory || []),
-                // ...commands.map(cmd => (
-                //     // If command is in successfulCommands, add '#SUCCESS' to it
-                //     successfulCommands.includes(cmd) ? `${cmd} #SUCCESS` : `${cmd} #FAILURE`
-                // ))
                 ...successfulCommands
             ]
         });
@@ -2185,12 +2205,12 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
     async deleteFiles(filePaths: string[]) {
         const deleteCommands: string[] = [];
         for (const filePath of filePaths) {
-            deleteCommands.push(`rm ${filePath}`);
+            deleteCommands.push(`rm -rf ${filePath}`);
         }
         // Remove the files from file manager
         this.fileManager.deleteFiles(filePaths);
         try {
-            await this.executeCommands(deleteCommands);
+            await this.executeCommands(deleteCommands, false);
             this.logger().info(`Deleted ${filePaths.length} files: ${filePaths.join(", ")}`);
         } catch (error) {
             this.logger().error('Error deleting files:', error);
@@ -2301,6 +2321,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
             });
 
             const context = GenerationContext.from(this.state, this.logger());
+            // Just fetch runtime errors
+            const errors = await this.fetchRuntimeErrors(false);
 
             // Process the user message using conversational assistant
             const conversationalResponse = await this.operations.processUserMessage.execute(
@@ -2319,7 +2341,8 @@ export class SimpleCodeGeneratorAgent extends Agent<Env, CodeGenState> {
                             isStreaming,
                             tool,
                         });
-                    }
+                    },
+                    errors
                 }, 
                 { env: this.env, agentId: this.getAgentId(), context, logger: this.logger(), inferenceContext: this.state.inferenceContext }
             );

@@ -58,6 +58,8 @@ export type {
   AgentAnalyticsResponseData,
 } from 'worker/api/controllers/analytics/types';
 
+export type { PlatformStatusData } from 'worker/api/controllers/status/types';
+
 // Model Config API Types
 export type {
   ModelConfigsData,
@@ -125,7 +127,7 @@ export type {
 
 export type {
   FavoriteToggleResult,
-  EnhancedUserStats,
+  UserStats,
   UserActivity,
   EncryptedSecret,
   UserModelConfigWithMetadata,
@@ -181,7 +183,7 @@ export interface FileType {
 
 // Streaming response wrapper types for agent session creation
 export interface StreamingResponse {
-  success: true;
+  success: boolean;
   stream: Response;
 }
 

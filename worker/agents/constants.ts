@@ -95,3 +95,6 @@ export const WebSocketMessageRequests = {
     // Terminal command request
     TERMINAL_COMMAND: 'terminal_command',
 };
+
+export const PREVIEW_EXPIRED_ERROR = 'Preview expired, attempting redeploy. Please try again after a minute or refresh the page';
+export const MAX_DEPLOYMENT_RETRIES = 5;

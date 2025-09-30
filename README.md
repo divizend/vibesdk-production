@@ -4,9 +4,12 @@
 
 <div align="center">
 
-**🌟 [Try the Live Demo](https://build.cloudflare.dev) 🌟**
 
-*See VibeSDK Build in action before deploying your own instance*
+## 🚀 Live Demo
+
+**[build.cloudflare.dev](https://build.cloudflare.dev)**
+
+*Explore VibeSDK Build before deploying your own stack.*
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/vibesdk)
 
@@ -15,6 +18,10 @@
 *Follow the setup guide below to configure required services*
 
 </div>
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=cloudflare/vibesdk&type=Date)](https://www.star-history.com/#cloudflare/vibesdk&Date)
 
 ---
 
@@ -65,6 +72,7 @@ Before clicking "Deploy to Cloudflare", have these ready:
 ### ✅ Prerequisites
 - Cloudflare Workers Paid Plan
 - Workers for Platforms subscription
+- Advanced Certificate Manager (needed when you map a first-level subdomain such as `abc.xyz.com` so Cloudflare can issue the required wildcard certificate for preview apps on `*.abc.xyz.com`)
 
 ### 🔑 Required API Key
 - **Google Gemini API Key** - Get from [ai.google.dev](https://ai.google.dev)
@@ -81,7 +89,18 @@ Once you click "Deploy to Cloudflare", you'll be taken to your Cloudflare dashbo
 - `SECRETS_ENCRYPTION_KEY` - Encryption key for secrets
 - `SANDBOX_INSTANCE_TYPE` - Container performance tier (optional, see section below)
 - `ALLOWED_EMAIL` - Email address of the user allowed to use the app. This is used to verify the user's identity and prevent unauthorized access.
-- `CUSTOM_DOMAIN` - Custom domain for your app that you have configured in Cloudflare (**Required**). This is needed for the app to work.
+- `CUSTOM_DOMAIN` - Custom domain for your app that you have configured in Cloudflare (**Required**). If you use a first-level subdomain such as `abc.xyz.com`, make sure the Advanced Certificate Manager add-on is active on that zone.
+
+### Custom domain DNS setup
+
+To serve preview apps correctly, add the following DNS record in the zone that hosts `CUSTOM_DOMAIN`:
+
+- Type: `CNAME`
+- Name: `*.abc`
+- Target: `abc.xyz.com` (replace with your base custom domain or another appropriate origin)
+- Proxy status: **Proxied** (orange cloud)
+
+Adjust the placeholder `abc`/`xyz` parts to match your domain. DNS propagation can take time—expect it to take up to an hour before previews resolve. This step may be automated in a future release, but it is required today.
 
 ### 🏗️ Sandbox Instance Configuration (Optional)
 
@@ -149,8 +168,8 @@ OAuth configuration is **not** shown on the initial deploy page. If you want use
 1. [Google Cloud Console](https://console.cloud.google.com) → Create Project
 2. Enable **Google+ API** 
 3. Create **OAuth 2.0 Client ID**
-4. Add authorized origins: `https://your-worker-name.workers.dev`
-5. Add redirect URI: `https://your-worker-name.workers.dev/api/auth/google/callback`
+4. Add authorized origins: `https://your-custom-domain.`
+5. Add redirect URI: `https://your-worker-name.workers.dev/api/auth/callback/google`
 6. Add to **both** `.dev.vars` (for local development) and `.prod.vars` (for deployment):
    ```bash
    GOOGLE_CLIENT_ID="your-google-client-id"
@@ -168,6 +187,16 @@ OAuth configuration is **not** shown on the initial deploy page. If you want use
    GITHUB_CLIENT_ID="your-github-client-id"
    GITHUB_CLIENT_SECRET="your-github-client-secret"
    ```
+
+**GitHub Export OAuth Setup:**
+1. Create a separate GitHub OAuth app (e.g., `VibeSDK Export`)—do not reuse the login app above.
+2. Authorization callback URL: `https://your-worker-name.workers.dev/api/export/github/callback` (or your custom domain equivalent).
+3. Add to **both** `.dev.vars` and `.prod.vars`:
+   ```bash
+   GITHUB_EXPORTER_CLIENT_ID="your-export-client-id"
+   GITHUB_EXPORTER_CLIENT_SECRET="your-export-client-secret"
+   ```
+4. Redeploy or restart local development so the new variables take effect.
 
 
 ---
@@ -262,6 +291,16 @@ Cloudflare VibeSDK generates apps in intelligent phases:
 4. **Styling Phase**: Adds CSS and visual design
 5. **Integration Phase**: Connects APIs and external services
 6. **Optimization Phase**: Performance improvements and error fixes
+
+---
+
+## After Deployment
+
+- The "Deploy to Cloudflare" button provisions the worker and also creates a GitHub repository in your account. Clone that repository to work locally.
+- Pushes to the `main` branch trigger automatic deployments; CI/CD is already wired up for you.
+- For a manual deployment, copy `.dev.vars.example` to `.prod.vars`, fill in production-only secrets, and run `bun run deploy`. The deploy script reads from `.prod.vars`.
+
+DNS updates made during setup, including the wildcard CNAME record described above, can take a while to propagate. Wait until the record resolves before testing preview apps.
 
 ---
 

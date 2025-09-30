@@ -54,7 +54,8 @@ import type{
 	OAuthProvider,
     RateLimitErrorResponse,
     CodeGenArgs,
-    AgentPreviewResponse
+    AgentPreviewResponse,
+    PlatformStatusData
 } from '@/api-types';
 import {
     
@@ -390,7 +391,7 @@ class ApiClient {
                 }
 			}
 
-			return { response, data };
+		return { response, data };
 		} catch (error) {
 			if (error instanceof ApiError) {
 				throw error;
@@ -402,6 +403,14 @@ class ApiClient {
 				endpoint,
 			);
 		}
+	}
+
+	// ===============================
+	// Platform Status API Methods
+	// ===============================
+
+	async getPlatformStatus(noToast: boolean = true): Promise<ApiResponse<PlatformStatusData>> {
+		return this.request<PlatformStatusData>('/api/status', undefined, noToast);
 	}
 
 	// ===============================
@@ -558,16 +567,31 @@ class ApiClient {
 	}
 
 	async createAgentSession(args: CodeGenArgs): Promise<AgentStreamingResponse> {
-		const { response } = await this.requestRaw('/api/agent', {
-			method: 'POST',
-			body: args,
-			skipJsonParsing: true, // Don't parse JSON for streaming response
-		});
-		
-		return {
-			success: true,
-			stream: response
-		};
+		try {
+			const { response, data } = await this.requestRaw('/api/agent', {
+				method: 'POST',
+				body: args,
+				skipJsonParsing: true, // Don't parse JSON for streaming response
+			});
+			
+			// Check if response is ok
+			if (!response.ok) {
+				// Parse error response if available
+				const errorMessage = data?.error?.message || `Agent creation failed with status: ${response.status}`;
+				throw new Error(errorMessage);
+			}
+			
+			return {
+				success: true,
+				stream: response
+			};
+		} catch (error) {
+			// Handle any network or parsing errors
+			const errorMessage = error instanceof Error ? error.message : 'Failed to create agent session';
+			toast.error(errorMessage);
+			
+            throw new Error(errorMessage);
+		}
 	}
 
 	/**
